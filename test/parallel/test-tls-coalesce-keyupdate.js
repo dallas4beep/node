@@ -49,7 +49,10 @@ server.on('keylog', (line) => {
 });
 
 const proxy = net.createServer(common.mustCall((socket) => {
-  const upstream = net.connect(server.address().port);
+  const upstream = net.connect({
+    port: server.address().port,
+    allowHalfOpen: true,
+  });
   upstream.pipe(socket);
   socket.on('end', () => upstream.end());
   socket.on('close', () => upstream.destroy());
