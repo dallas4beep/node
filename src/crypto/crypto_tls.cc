@@ -894,8 +894,7 @@ void TLSWrap::ClearOut() {
       }
       Debug(this, "Read %d bytes of cleartext output", read);
 
-      if (read <= 0)
-        break;
+      if (read <= 0) break;
       length += read;
       if (length == kClearOutChunkSize ||
           (NodeBIO::FromBIO(enc_in_)->Length() == 0 &&
@@ -904,8 +903,7 @@ void TLSWrap::ClearOut() {
       }
     }
 
-    if (length == 0)
-      break;
+    if (length == 0) break;
 
     // An SSL_read() failure that ended this batch has to be examined before
     // calling into JS (see below), and is reported after the data it follows.
@@ -936,10 +934,8 @@ void TLSWrap::ClearOut() {
       current += avail;
     }
 
-    if (failed)
-      EmitClearOutError(err, error);
-    if (read <= 0)
-      return;
+    if (failed) EmitClearOutError(err, error);
+    if (read <= 0) return;
   }
 
   // We need to check whether an error occurred or the connection was
@@ -952,8 +948,7 @@ void TLSWrap::ClearOut() {
     HandleScope handle_scope(env()->isolate());
     int err;
     Local<Value> error;
-    if (GetClearOutError(read, &err, &error))
-      EmitClearOutError(err, error);
+    if (GetClearOutError(read, &err, &error)) EmitClearOutError(err, error);
   }
 }
 
@@ -964,49 +959,47 @@ bool TLSWrap::GetClearOutError(int read, int* err, Local<Value>* error) {
       return true;
 
     case SSL_ERROR_SSL:
-    case SSL_ERROR_SYSCALL:
-      {
-        unsigned long ssl_err = ERR_peek_error();  // NOLINT(runtime/int)
+    case SSL_ERROR_SYSCALL: {
+      unsigned long ssl_err = ERR_peek_error();  // NOLINT(runtime/int)
 
-        Local<Context> context = env()->isolate()->GetCurrentContext();
-        if (context.IsEmpty()) [[unlikely]]
-          return false;
-        const std::string error_str = GetBIOError();
-        Local<String> message = OneByteString(env()->isolate(), error_str);
-        if (message.IsEmpty()) [[unlikely]]
-          return false;
-        *error = Exception::Error(message);
-        if (error->IsEmpty()) [[unlikely]]
-          return false;
-        Local<Object> obj;
-        if (!(*error)->ToObject(context).ToLocal(&obj)) [[unlikely]]
-          return false;
+      Local<Context> context = env()->isolate()->GetCurrentContext();
+      if (context.IsEmpty()) [[unlikely]]
+        return false;
+      const std::string error_str = GetBIOError();
+      Local<String> message = OneByteString(env()->isolate(), error_str);
+      if (message.IsEmpty()) [[unlikely]]
+        return false;
+      *error = Exception::Error(message);
+      if (error->IsEmpty()) [[unlikely]]
+        return false;
+      Local<Object> obj;
+      if (!(*error)->ToObject(context).ToLocal(&obj)) [[unlikely]]
+        return false;
 
-        const char* ls = ERR_lib_error_string(ssl_err);
+      const char* ls = ERR_lib_error_string(ssl_err);
 #if NCRYPTO_USE_OPENSSL3_PROVIDER
-        const char* fs = nullptr;
+      const char* fs = nullptr;
 #else
-        const char* fs = ERR_func_error_string(ssl_err);
+      const char* fs = ERR_func_error_string(ssl_err);
 #endif
-        const char* rs = ERR_reason_error_string(ssl_err);
-        if (!Set(env(), obj, env()->library_string(), ls) ||
-            !Set(env(), obj, env()->function_string(), fs) ||
-            !Set(env(), obj, env()->reason_string(), rs, false)) return false;
-        // SSL has no API to recover the error name from the number, so we
-        // transform reason strings like "this error" to "ERR_SSL_THIS_ERROR",
-        // which ends up being close to the original error macro name.
-        std::string code(rs);
-        // TODO(RaisinTen): Pass an appropriate execution policy when it is
-        // implemented in our supported compilers.
-        std::transform(code.begin(), code.end(), code.begin(),
-                       [](char c) { return c == ' ' ? '_' : ToUpper(c); });
-        if (!Set(env(),
-                 obj,
-                 env()->code_string(),
-                 ("ERR_SSL_" + code).c_str())) {
-          return false;
-        }
+      const char* rs = ERR_reason_error_string(ssl_err);
+      if (!Set(env(), obj, env()->library_string(), ls) ||
+          !Set(env(), obj, env()->function_string(), fs) ||
+          !Set(env(), obj, env()->reason_string(), rs, false))
+        return false;
+      // SSL has no API to recover the error name from the number, so we
+      // transform reason strings like "this error" to "ERR_SSL_THIS_ERROR",
+      // which ends up being close to the original error macro name.
+      std::string code(rs);
+      // TODO(RaisinTen): Pass an appropriate execution policy when it is
+      // implemented in our supported compilers.
+      std::transform(code.begin(), code.end(), code.begin(), [](char c) {
+        return c == ' ' ? '_' : ToUpper(c);
+      });
+      if (!Set(env(), obj, env()->code_string(), ("ERR_SSL_" + code).c_str())) {
+        return false;
       }
+    }
       return true;
 
     default:
@@ -1026,8 +1019,7 @@ void TLSWrap::EmitClearOutError(int err, Local<Value> error) {
   Debug(this, "Got SSL error (%d), calling onerror", err);
   // When TLS Alert are stored in wbio,
   // it should be flushed to socket before destroyed.
-  if (BIO_pending(enc_out_) != 0)
-    EncOut();
+  if (BIO_pending(enc_out_) != 0) EncOut();
 
   MakeCallback(env()->onerror_string(), 1, &error);
 }
