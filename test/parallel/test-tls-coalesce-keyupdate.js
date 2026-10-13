@@ -11,6 +11,13 @@ const { spawn } = require('child_process');
 const net = require('net');
 const tls = require('tls');
 const fixtures = require('../common/fixtures');
+const destroy = process.argv[2] === 'destroy';
+if (!destroy) {
+  const child = spawn(process.execPath, [__filename, 'destroy'], {
+    stdio: 'inherit',
+  });
+  child.on('exit', common.mustCall((code) => assert.strictEqual(code, 0)));
+}
 
 // TLS 1.3 control records have the same outer type as application records.
 // Deliver data, KeyUpdate and more data together, and check callback ordering.
@@ -20,7 +27,7 @@ let received = '';
 let holding = false;
 let client;
 
-const onUpdate = common.mustCall(() => {
+const onUpdate = destroy ? common.mustNotCall() : common.mustCall(() => {
   assert.strictEqual(received, before);
 });
 const server = tls.createServer({
@@ -31,15 +38,24 @@ const server = tls.createServer({
   holding = true;
   socket.on('data', common.mustCallAtLeast((data) => {
     received += data;
-    if (received === before) socket.write('ack');
+    if (received === before) {
+      if (destroy) {
+        socket._destroySSL();
+        socket.destroy();
+        server.close();
+        proxy.close();
+        return;
+      }
+      socket.write('ack');
+    }
     if (received === before + after) {
       socket.end();
       server.close();
       proxy.close();
     }
   }));
-  socket.on('end', common.mustCall(() => {
-    assert.strictEqual(received, before + after);
+  socket.on('close', common.mustCall(() => {
+    assert.strictEqual(received, destroy ? before : before + after);
   }));
   socket.on('error', common.mustNotCall());
   client.stdin.write(before);
@@ -93,7 +109,11 @@ server.listen(0, common.mustCall(() => {
     client.stderr.resume();
     client.on('error', common.mustNotCall());
     client.on('exit', common.mustCall((code) => {
-      assert.strictEqual(code, 0);
+      if (destroy) {
+        assert(code === 0 || code === 1);
+      } else {
+        assert.strictEqual(code, 0);
+      }
     }));
   }));
 }));

@@ -83,7 +83,7 @@ class TLSWrap : public AsyncWrap,
   inline bool is_cert_cb_running() const { return flags_.cert_cb_running; }
   inline bool is_waiting_cert_cb() const { return cert_cb_ != nullptr; }
   inline bool has_session_callbacks() const { return flags_.session_callbacks; }
-  void FlushPendingClearOut();
+  bool FlushPendingClearOut();
   // We need to suspend the ClientHello only for server session id
   // callbacks, and only on the first pass.
   inline bool should_suspend_for_client_hello() const {
@@ -330,6 +330,7 @@ class TLSWrap : public AsyncWrap,
   std::unique_ptr<v8::BackingStore> pending_cleartext_input_;
   // References ClearOut's stack buffer only while SSL_read() is on the stack.
   std::span<const char> pending_cleartext_output_;
+  bool destroy_pending_ = false;
   size_t write_size_ = 0;
   BaseObjectPtr<AsyncWrap> current_write_;
   BaseObjectPtr<AsyncWrap> current_empty_write_;

@@ -150,7 +150,7 @@ ClientHelloResult EarlyClientHelloCallback(const ClientHelloContext& hello) {
 
 void KeylogCallback(const SSL* s, const char* line) {
   TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(s));
-  w->FlushPendingClearOut();
+  if (!w->FlushPendingClearOut()) return;
   Environment* env = w->env();
   HandleScope handle_scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -174,7 +174,7 @@ int NewSessionCallback(SSL* s, SSL_SESSION* sess) {
 
   if (!w->has_session_callbacks()) [[unlikely]]
     return 0;
-  w->FlushPendingClearOut();
+  if (!w->FlushPendingClearOut()) return 0;
 
   // Check if session is small enough to be stored
   int size = i2d_SSL_SESSION(sess, nullptr);
@@ -691,7 +691,7 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {
   // SSL_renegotiate_pending() should take `const SSL*`, but it does not.
   SSL* ssl = const_cast<SSL*>(ssl_);
   TLSWrap* c = static_cast<TLSWrap*>(SSL_get_app_data(ssl_));
-  c->FlushPendingClearOut();
+  if (!c->FlushPendingClearOut()) return;
   Environment* env = c->env();
   HandleScope handle_scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -728,6 +728,7 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {
 }
 
 void TLSWrap::EncOut() {
+  if (destroy_pending_) return;
   Debug(this, "Trying to write encrypted output");
 
   // Write in progress
@@ -875,8 +876,8 @@ void TLSWrap::ClearOut() {
     return;
   }
 
-  if (ssl_ == nullptr) {
-    Debug(this, "Returning from ClearOut(), ssl_ == nullptr");
+  if (ssl_ == nullptr || destroy_pending_) {
+    Debug(this, "Returning from ClearOut(), no usable SSL context");
     return;
   }
 
@@ -895,6 +896,10 @@ void TLSWrap::ClearOut() {
       {
         SSLLibraryCallScope ssl_library_call_scope(this);
         read = SSL_read(ssl_.get(), out + length, kClearOutChunkSize - length);
+      }
+      if (destroy_pending_) {
+        pending_cleartext_output_ = {};
+        return;
       }
       // A protocol callback may have delivered the preceding bytes. The
       // current read still wrote after that prefix, so move its output back.
@@ -957,16 +962,16 @@ bool TLSWrap::EmitClearOut(std::span<const char> output) {
     memcpy(buf.base, output.data(), avail);
     EmitRead(avail, buf);
     // OnRead() calls into JS, which can destroy the SSL context.
-    if (ssl_ == nullptr) return false;
+    if (ssl_ == nullptr || destroy_pending_) return false;
     output = output.subspan(avail);
   }
   return true;
 }
 
-void TLSWrap::FlushPendingClearOut() {
+bool TLSWrap::FlushPendingClearOut() {
   const auto output = pending_cleartext_output_;
   pending_cleartext_output_ = {};
-  EmitClearOut(output);
+  return !destroy_pending_ && EmitClearOut(output);
 }
 
 bool TLSWrap::GetClearOutError(int read, int* err, Local<Value>* error) {
@@ -1044,7 +1049,7 @@ void TLSWrap::EmitClearOutError(int err, Local<Value> error) {
 void TLSWrap::ClearIn() {
   Debug(this, "Trying to write cleartext input");
 
-  if (ssl_ == nullptr) {
+  if (ssl_ == nullptr || destroy_pending_) {
     Debug(this, "Returning from ClearIn(), ssl_ == nullptr");
     return;
   }
@@ -1493,6 +1498,15 @@ void TLSWrap::DestroySSL(const FunctionCallbackInfo<Value>& args) {
 }
 
 void TLSWrap::Destroy() {
+  if (in_ssl_library_call()) {
+    if (!destroy_pending_) {
+      destroy_pending_ = true;
+      BaseObjectPtr<TLSWrap> strong_ref{this};
+      env()->SetImmediate([this, strong_ref](Environment* env) { Destroy(); });
+    }
+    return;
+  }
+  destroy_pending_ = false;
   if (!ssl_)
     return;
 
