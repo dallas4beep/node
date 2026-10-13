@@ -13,7 +13,7 @@ const tls = require('tls');
 const fixtures = require('../common/fixtures');
 
 const RECORD_SIZE = 512;
-const RECORDS = 64;
+const RECORDS = 256;
 const payload = Buffer.alloc(RECORD_SIZE * RECORDS);
 for (let i = 0; i < RECORDS; i++)
   payload.fill(i & 0xff, i * RECORD_SIZE, (i + 1) * RECORD_SIZE);
@@ -48,6 +48,7 @@ function sendPayload(socket) {
       assert.deepStrictEqual(Buffer.concat(chunks), payload);
       assert(chunks.length < RECORDS,
              `${chunks.length} chunks for ${RECORDS} records`);
+      assert(chunks.every((chunk) => chunk.length <= 64 * 1024));
       server.close();
     }));
   }));

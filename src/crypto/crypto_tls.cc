@@ -150,6 +150,7 @@ ClientHelloResult EarlyClientHelloCallback(const ClientHelloContext& hello) {
 
 void KeylogCallback(const SSL* s, const char* line) {
   TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(s));
+  w->FlushPendingClearOut();
   Environment* env = w->env();
   HandleScope handle_scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -173,6 +174,7 @@ int NewSessionCallback(SSL* s, SSL_SESSION* sess) {
 
   if (!w->has_session_callbacks()) [[unlikely]]
     return 0;
+  w->FlushPendingClearOut();
 
   // Check if session is small enough to be stored
   int size = i2d_SSL_SESSION(sess, nullptr);
@@ -689,6 +691,7 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {
   // SSL_renegotiate_pending() should take `const SSL*`, but it does not.
   SSL* ssl = const_cast<SSL*>(ssl_);
   TLSWrap* c = static_cast<TLSWrap*>(SSL_get_app_data(ssl_));
+  c->FlushPendingClearOut();
   Environment* env = c->env();
   HandleScope handle_scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -880,7 +883,7 @@ void TLSWrap::ClearOut() {
   MarkPopErrorOnReturn mark_pop_error_on_return;
 
   // SSL_read() returns at most one TLS record per call. Records that are
-  // already buffered are decrypted together, up to the size of a full record,
+  // already buffered are decrypted together, up to 64 KiB,
   // and emitted as one chunk: one allocation and one call into JS for a burst
   // of small records instead of one per record.
   char out[kClearOutChunkSize];
@@ -888,10 +891,18 @@ void TLSWrap::ClearOut() {
   for (;;) {
     int length = 0;
     for (;;) {
+      pending_cleartext_output_ = {out, static_cast<size_t>(length)};
       {
         SSLLibraryCallScope ssl_library_call_scope(this);
         read = SSL_read(ssl_.get(), out + length, kClearOutChunkSize - length);
       }
+      // A protocol callback may have delivered the preceding bytes. The
+      // current read still wrote after that prefix, so move its output back.
+      if (length > 0 && pending_cleartext_output_.empty()) {
+        if (read > 0) memmove(out, out + length, read);
+        length = 0;
+      }
+      pending_cleartext_output_ = {};
       Debug(this, "Read %d bytes of cleartext output", read);
 
       if (read <= 0) break;
@@ -918,27 +929,7 @@ void TLSWrap::ClearOut() {
     Local<Value> error;
     const bool failed = read <= 0 && GetClearOutError(read, &err, &error);
 
-    char* current = out;
-    while (length > 0) {
-      int avail = length;
-
-      uv_buf_t buf = EmitAlloc(avail);
-      if (static_cast<int>(buf.len) < avail)
-        avail = buf.len;
-      memcpy(buf.base, current, avail);
-      EmitRead(avail, buf);
-
-      // Caveat emptor: OnRead() calls into JS land which can result in
-      // the SSL context object being destroyed.  We have to carefully
-      // check that ssl_ != nullptr afterwards.
-      if (ssl_ == nullptr) {
-        Debug(this, "Returning from read loop, ssl_ == nullptr");
-        return;
-      }
-
-      length -= avail;
-      current += avail;
-    }
+    if (!EmitClearOut({out, static_cast<size_t>(length)})) return;
 
     if (failed) EmitClearOutError(err, error);
     if (read <= 0) return;
@@ -956,6 +947,26 @@ void TLSWrap::ClearOut() {
     Local<Value> error;
     if (GetClearOutError(read, &err, &error)) EmitClearOutError(err, error);
   }
+}
+
+bool TLSWrap::EmitClearOut(std::span<const char> output) {
+  while (!output.empty()) {
+    int avail = output.size();
+    uv_buf_t buf = EmitAlloc(avail);
+    if (static_cast<int>(buf.len) < avail) avail = buf.len;
+    memcpy(buf.base, output.data(), avail);
+    EmitRead(avail, buf);
+    // OnRead() calls into JS, which can destroy the SSL context.
+    if (ssl_ == nullptr) return false;
+    output = output.subspan(avail);
+  }
+  return true;
+}
+
+void TLSWrap::FlushPendingClearOut() {
+  const auto output = pending_cleartext_output_;
+  pending_cleartext_output_ = {};
+  EmitClearOut(output);
 }
 
 bool TLSWrap::GetClearOutError(int read, int* err, Local<Value>* error) {
