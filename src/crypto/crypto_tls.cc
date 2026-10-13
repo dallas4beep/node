@@ -896,10 +896,16 @@ void TLSWrap::ClearOut() {
 
       if (read <= 0) break;
       length += read;
-      if (length == kClearOutChunkSize ||
-          (NodeBIO::FromBIO(enc_in_)->Length() == 0 &&
-           SSL_pending(ssl_.get()) == 0)) {
-        break;
+      if (length == kClearOutChunkSize) break;
+      if (SSL_pending(ssl_.get()) == 0) {
+        size_t pending;
+        const char* next = NodeBIO::FromBIO(enc_in_)->Peek(&pending);
+        // Protocol records can invoke JS callbacks, such as TLS 1.2
+        // renegotiation. Deliver preceding data before processing them.
+        if (pending == 0 ||
+            static_cast<unsigned char>(next[0]) != SSL3_RT_APPLICATION_DATA) {
+          break;
+        }
       }
     }
 
