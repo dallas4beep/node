@@ -5,6 +5,7 @@ const common = require('../common');
 const assert = require('assert');
 const {
   broadcast,
+  dump,
   from,
   pull,
   push,
@@ -65,14 +66,72 @@ async function testPullStatefulTransformReceiver() {
 }
 
 async function testPullWithAbortSignal() {
+  let started = false;
   async function* gen() {
+    started = true;
     yield [new Uint8Array([1])];
   }
 
-  assert.throws(
-    () => pull(gen(), { signal: AbortSignal.abort() }),
-    { name: 'AbortError' },
-  );
+  // An already-aborted signal does not make pull() throw; the returned
+  // iterable rejects instead, without reading from the source.
+  const signal = AbortSignal.abort();
+  const iterator = pull(gen(), { signal })[Symbol.asyncIterator]();
+  await assert.rejects(iterator.next(), (error) => error === signal.reason);
+  await assert.rejects(iterator.next(), (error) => error === signal.reason);
+  assert.strictEqual(started, false);
+  assert.deepStrictEqual(await iterator.return(),
+                         { __proto__: null, done: true, value: undefined });
+
+  await assert.rejects(text(pull(gen(), (chunks) => chunks, { signal })),
+                       (error) => error === signal.reason);
+  assert.strictEqual(started, false);
+}
+
+async function testPullKeepsRejectingAfterAbort() {
+  for (const transforms of [[], [(chunks) => chunks]]) {
+    // Abort while a read is pending.
+    {
+      const ac = new AbortController();
+      const reason = new Error('stop');
+      async function* gen() {
+        yield [new Uint8Array([1])];
+        await new Promise(() => {});
+      }
+      const iterator =
+        pull(gen(), ...transforms, { signal: ac.signal })[Symbol.asyncIterator]();
+      assert.strictEqual((await iterator.next()).done, false);
+      const pending = iterator.next();
+      ac.abort(reason);
+      await assert.rejects(pending, (error) => error === reason);
+      await assert.rejects(iterator.next(), (error) => error === reason);
+      await assert.rejects(iterator.next(), (error) => error === reason);
+    }
+    // Abort between reads.
+    {
+      const ac = new AbortController();
+      const reason = new Error('stop');
+      async function* gen() {
+        yield [new Uint8Array([1])];
+        yield [new Uint8Array([2])];
+      }
+      const iterator =
+        pull(gen(), ...transforms, { signal: ac.signal })[Symbol.asyncIterator]();
+      assert.strictEqual((await iterator.next()).done, false);
+      ac.abort(reason);
+      await assert.rejects(iterator.next(), (error) => error === reason);
+      await assert.rejects(iterator.next(), (error) => error === reason);
+    }
+    // Aborting after the pipeline completed does not change the result.
+    {
+      const ac = new AbortController();
+      const iterator =
+        pull(from('x'), ...transforms, { signal: ac.signal })[Symbol.asyncIterator]();
+      assert.strictEqual((await iterator.next()).done, false);
+      assert.strictEqual((await iterator.next()).done, true);
+      ac.abort();
+      assert.strictEqual((await iterator.next()).done, true);
+    }
+  }
 }
 
 async function testPullNormalizesSourceAtCallTime() {
@@ -98,7 +157,7 @@ async function testPullNormalizesSourceAtCallTime() {
   assert.strictEqual(iteratorCalls, 1);
 }
 
-function testPullPreAbortOrdering() {
+async function testPullPreAbortOrdering() {
   const reason = new Error('already aborted');
   let protocolCalls = 0;
   const source = {
@@ -109,8 +168,11 @@ function testPullPreAbortOrdering() {
   };
   const signal = AbortSignal.abort(reason);
 
-  assert.throws(() => pull(source, { signal }), (error) => error === reason);
+  // Source conversion still happens when pull() is called; the abort is
+  // reported when the result is read.
+  const result = pull(source, { signal });
   assert.strictEqual(protocolCalls, 1);
+  await assert.rejects(text(result), (error) => error === reason);
   assert.throws(
     () => pull(null, { signal }),
     { code: 'ERR_INVALID_ARG_TYPE' },
@@ -159,10 +221,7 @@ async function testTransformSignalListenerErrorOnSourceError() {
 
   await assert.rejects(
     async () => {
-      // eslint-disable-next-line no-unused-vars
-      for await (const _ of pull(failingSource(), throwingTransform)) {
-        // Consume
-      }
+      await dump(pull(failingSource(), throwingTransform));
     },
     { message: 'source error' },
   );
@@ -182,8 +241,7 @@ async function testPullSourceError() {
     throw new Error('source boom');
   }
   await assert.rejects(async () => {
-    // eslint-disable-next-line no-unused-vars
-    for await (const _ of pull(failingSource())) { /* consume */ }
+    await dump(pull(failingSource()));
   }, { message: 'source boom' });
 }
 
@@ -191,8 +249,7 @@ async function testPullSourceError() {
 async function testTapCallbackError() {
   const badTap = tap(() => { throw new Error('tap boom'); });
   await assert.rejects(async () => {
-    // eslint-disable-next-line no-unused-vars
-    for await (const _ of pull(from('hello'), badTap)) { /* consume */ }
+    await dump(pull(from('hello'), badTap));
   }, { message: 'tap boom' });
 }
 
@@ -350,8 +407,7 @@ async function testPullStatelessTransformError() {
     throw new Error('async stateless boom');
   };
   await assert.rejects(async () => {
-    // eslint-disable-next-line no-unused-vars
-    for await (const _ of pull(from('hello'), badTransform)) { /* consume */ }
+    await dump(pull(from('hello'), badTransform));
   }, { message: 'async stateless boom' });
 }
 
@@ -366,8 +422,7 @@ async function testPullStatefulTransformError() {
     },
   };
   await assert.rejects(async () => {
-    // eslint-disable-next-line no-unused-vars
-    for await (const _ of pull(from('hello'), badStateful)) { /* consume */ }
+    await dump(pull(from('hello'), badStateful));
   }, { message: 'async stateful boom' });
 }
 
@@ -405,8 +460,7 @@ async function testPullStatelessTransformFlushError() {
     return chunks;
   };
   await assert.rejects(async () => {
-    // eslint-disable-next-line no-unused-vars
-    for await (const _ of pull(from('hello'), badFlush)) { /* consume */ }
+    await dump(pull(from('hello'), badFlush));
   }, { message: 'async flush boom' });
 }
 
@@ -528,6 +582,7 @@ async function testTransformOptionsNotShared() {
     testPullStatefulTransform(),
     testPullStatefulTransformReceiver(),
     testPullWithAbortSignal(),
+    testPullKeepsRejectingAfterAbort(),
     testPullNormalizesSourceAtCallTime(),
     testPullPreAbortOrdering(),
     testPullChainedTransforms(),

@@ -264,14 +264,14 @@ When the permission model is enabled these operations are disabled and throw
 `ERR_ACCESS_DENIED`, regardless of how the descriptor was obtained. This applies
 both to the top-level `node:fs` functions and to the equivalent
 `FileHandle` methods, and currently includes `fsync`/`fdatasync`,
-`fchmod`, and `fchown` (and their synchronous variants).
+`fchmod`, `fchown`, and `futimes` (and their synchronous variants).
 
 #### Configuration file support
 
 In addition to passing permission flags on the command line, they can also be
-declared in a Node.js configuration file when using the experimental
-\[`--experimental-config-file`]\[] flag. Permission options must be placed inside
-the `permission` top-level object.
+declared in a Node.js configuration file when using the [`--config-file`][]
+flag. Permission options must be placed inside the `permission` top-level
+object.
 
 Example `node.config.json`:
 
@@ -294,7 +294,7 @@ When the `permission` namespace is present in the configuration file, Node.js
 automatically enables the `--permission` flag. Run with:
 
 ```console
-$ node --experimental-default-config-file app.js
+$ node --config-file app.js
 ```
 
 #### Using the Permission Model with `npx`
@@ -417,6 +417,7 @@ Developers relying on --permission to sandbox untrusted code should be aware tha
 [`--allow-openssl-store`]: cli.md#--allow-openssl-store
 [`--allow-wasi`]: cli.md#--allow-wasi
 [`--allow-worker`]: cli.md#--allow-worker
+[`--config-file`]: cli.md#--config-filepath---config-file
 [`--permission-audit`]: cli.md#--permission-audit
 [`--permission`]: cli.md#--permission
 [`crypto.createPrivateKey()`]: crypto.md#cryptocreateprivatekeykey

@@ -98,6 +98,12 @@ and libc version. The table below lists the support tier for each supported
 combination. A list of [supported compile toolchains](#supported-toolchains) is
 also supplied for tier 1 platforms.
 
+Some built-in functionality requires WebAssembly or runtime allocation of
+executable memory. When a capability is unavailable, Node.js does not guarantee
+an alternative implementation of the affected feature. See the
+[`--jitless` documentation](doc/api/cli.md#--jitless) and
+[FFI documentation](doc/api/ffi.md) for the corresponding limitations and errors.
+
 **For production applications, run Node.js on supported platforms only (Tier 1 or 2).**
 
 Node.js does not support a platform version if a vendor has expired support
@@ -187,6 +193,7 @@ Binaries at <https://nodejs.org/download/release/> are produced on:
 | linux-ppc64le           | RHEL 8 with Clang 20.1 and gcc-toolset-14-libatomic-devel[^6] |
 | linux-s390x             | RHEL 8 with Clang 20.1 and gcc-toolset-14-libatomic-devel[^6] |
 | linux-x64               | RHEL 8 with Clang 20.1 and gcc-toolset-14-libatomic-devel[^6] |
+| linux-x64-musl          | Alpine 3.23 with Clang 21                                     |
 | win-arm64               | Windows Server 2022 (x64) with Visual Studio 2022             |
 | win-x64                 | Windows Server 2022 (x64) with Visual Studio 2022             |
 
