@@ -150,6 +150,7 @@ ClientHelloResult EarlyClientHelloCallback(const ClientHelloContext& hello) {
 
 void KeylogCallback(const SSL* s, const char* line) {
   TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(s));
+  if (!w->FlushPendingClearOut()) return;
   Environment* env = w->env();
   HandleScope handle_scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -173,6 +174,7 @@ int NewSessionCallback(SSL* s, SSL_SESSION* sess) {
 
   if (!w->has_session_callbacks()) [[unlikely]]
     return 0;
+  if (!w->FlushPendingClearOut()) return 0;
 
   // Check if session is small enough to be stored
   int size = i2d_SSL_SESSION(sess, nullptr);
@@ -689,6 +691,7 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {
   // SSL_renegotiate_pending() should take `const SSL*`, but it does not.
   SSL* ssl = const_cast<SSL*>(ssl_);
   TLSWrap* c = static_cast<TLSWrap*>(SSL_get_app_data(ssl_));
+  if (!c->FlushPendingClearOut()) return;
   Environment* env = c->env();
   HandleScope handle_scope(env->isolate());
   Context::Scope context_scope(env->context());
@@ -725,6 +728,7 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {
 }
 
 void TLSWrap::EncOut() {
+  if (destroy_pending_) return;
   Debug(this, "Trying to write encrypted output");
 
   // Write in progress
@@ -872,46 +876,68 @@ void TLSWrap::ClearOut() {
     return;
   }
 
-  if (ssl_ == nullptr) {
-    Debug(this, "Returning from ClearOut(), ssl_ == nullptr");
+  if (ssl_ == nullptr || destroy_pending_) {
+    Debug(this, "Returning from ClearOut(), no usable SSL context");
     return;
   }
 
   MarkPopErrorOnReturn mark_pop_error_on_return;
 
+  // SSL_read() returns at most one TLS record per call. Records that are
+  // already buffered are decrypted together, up to 64 KiB,
+  // and emitted as one chunk: one allocation and one call into JS for a burst
+  // of small records instead of one per record.
   char out[kClearOutChunkSize];
   int read;
   for (;;) {
-    {
-      SSLLibraryCallScope ssl_library_call_scope(this);
-      read = SSL_read(ssl_.get(), out, sizeof(out));
-    }
-    Debug(this, "Read %d bytes of cleartext output", read);
-
-    if (read <= 0)
-      break;
-
-    char* current = out;
-    while (read > 0) {
-      int avail = read;
-
-      uv_buf_t buf = EmitAlloc(avail);
-      if (static_cast<int>(buf.len) < avail)
-        avail = buf.len;
-      memcpy(buf.base, current, avail);
-      EmitRead(avail, buf);
-
-      // Caveat emptor: OnRead() calls into JS land which can result in
-      // the SSL context object being destroyed.  We have to carefully
-      // check that ssl_ != nullptr afterwards.
-      if (ssl_ == nullptr) {
-        Debug(this, "Returning from read loop, ssl_ == nullptr");
+    int length = 0;
+    for (;;) {
+      pending_cleartext_output_ = {out, static_cast<size_t>(length)};
+      {
+        SSLLibraryCallScope ssl_library_call_scope(this);
+        read = SSL_read(ssl_.get(), out + length, kClearOutChunkSize - length);
+      }
+      if (destroy_pending_) {
+        pending_cleartext_output_ = {};
         return;
       }
+      // A protocol callback may have delivered the preceding bytes. The
+      // current read still wrote after that prefix, so move its output back.
+      if (length > 0 && pending_cleartext_output_.empty()) {
+        if (read > 0) memmove(out, out + length, read);
+        length = 0;
+      }
+      pending_cleartext_output_ = {};
+      Debug(this, "Read %d bytes of cleartext output", read);
 
-      read -= avail;
-      current += avail;
+      if (read <= 0) break;
+      length += read;
+      if (length == kClearOutChunkSize) break;
+      if (SSL_pending(ssl_.get()) == 0) {
+        size_t pending;
+        const char* next = NodeBIO::FromBIO(enc_in_)->Peek(&pending);
+        // Protocol records can invoke JS callbacks, such as TLS 1.2
+        // renegotiation. Deliver preceding data before processing them.
+        if (pending == 0 ||
+            static_cast<unsigned char>(next[0]) != SSL3_RT_APPLICATION_DATA) {
+          break;
+        }
+      }
     }
+
+    if (length == 0) break;
+
+    // An SSL_read() failure that ended this batch has to be examined before
+    // calling into JS (see below), and is reported after the data it follows.
+    HandleScope handle_scope(env()->isolate());
+    int err = 0;
+    Local<Value> error;
+    const bool failed = read <= 0 && GetClearOutError(read, &err, &error);
+
+    if (!EmitClearOut({out, static_cast<size_t>(length)})) return;
+
+    if (failed) EmitClearOutError(err, error);
+    if (read <= 0) return;
   }
 
   // We need to check whether an error occurred or the connection was
@@ -922,76 +948,108 @@ void TLSWrap::ClearOut() {
   // altogether.
   if (read <= 0) {
     HandleScope handle_scope(env()->isolate());
+    int err;
     Local<Value> error;
-    int err = SSL_get_error(ssl_.get(), read);
-    switch (err) {
-      case SSL_ERROR_ZERO_RETURN:
-        if (!flags_.eof) {
-          flags_.eof = true;
-          EmitRead(UV_EOF);
-        }
-        return;
-
-      case SSL_ERROR_SSL:
-      case SSL_ERROR_SYSCALL:
-        {
-          unsigned long ssl_err = ERR_peek_error();  // NOLINT(runtime/int)
-
-          Local<Context> context = env()->isolate()->GetCurrentContext();
-          if (context.IsEmpty()) [[unlikely]]
-            return;
-          const std::string error_str = GetBIOError();
-          Local<String> message = OneByteString(env()->isolate(), error_str);
-          if (message.IsEmpty()) [[unlikely]]
-            return;
-          error = Exception::Error(message);
-          if (error.IsEmpty()) [[unlikely]]
-            return;
-          Local<Object> obj;
-          if (!error->ToObject(context).ToLocal(&obj)) [[unlikely]]
-            return;
-
-          const char* ls = ERR_lib_error_string(ssl_err);
-#if NCRYPTO_USE_OPENSSL3_PROVIDER
-          const char* fs = nullptr;
-#else
-          const char* fs = ERR_func_error_string(ssl_err);
-#endif
-          const char* rs = ERR_reason_error_string(ssl_err);
-          if (!Set(env(), obj, env()->library_string(), ls) ||
-              !Set(env(), obj, env()->function_string(), fs) ||
-              !Set(env(), obj, env()->reason_string(), rs, false)) return;
-          // SSL has no API to recover the error name from the number, so we
-          // transform reason strings like "this error" to "ERR_SSL_THIS_ERROR",
-          // which ends up being close to the original error macro name.
-          std::string code(rs);
-          // TODO(RaisinTen): Pass an appropriate execution policy when it is
-          // implemented in our supported compilers.
-          std::transform(code.begin(), code.end(), code.begin(),
-                         [](char c) { return c == ' ' ? '_' : ToUpper(c); });
-          if (!Set(env(), obj,
-                   env()->code_string(), ("ERR_SSL_" + code).c_str())) return;
-        }
-        break;
-
-      default:
-        return;
-    }
-
-    Debug(this, "Got SSL error (%d), calling onerror", err);
-    // When TLS Alert are stored in wbio,
-    // it should be flushed to socket before destroyed.
-    if (BIO_pending(enc_out_) != 0)
-      EncOut();
-
-    MakeCallback(env()->onerror_string(), 1, &error);
+    if (GetClearOutError(read, &err, &error)) EmitClearOutError(err, error);
   }
+}
+
+bool TLSWrap::EmitClearOut(std::span<const char> output) {
+  while (!output.empty()) {
+    int avail = output.size();
+    uv_buf_t buf = EmitAlloc(avail);
+    if (static_cast<int>(buf.len) < avail) avail = buf.len;
+    memcpy(buf.base, output.data(), avail);
+    EmitRead(avail, buf);
+    // OnRead() calls into JS, which can destroy the SSL context.
+    if (ssl_ == nullptr || destroy_pending_) return false;
+    output = output.subspan(avail);
+  }
+  return true;
+}
+
+bool TLSWrap::FlushPendingClearOut() {
+  const auto output = pending_cleartext_output_;
+  pending_cleartext_output_ = {};
+  return !destroy_pending_ && EmitClearOut(output);
+}
+
+bool TLSWrap::GetClearOutError(int read, int* err, Local<Value>* error) {
+  *err = SSL_get_error(ssl_.get(), read);
+  switch (*err) {
+    case SSL_ERROR_ZERO_RETURN:
+      return true;
+
+    case SSL_ERROR_SSL:
+    case SSL_ERROR_SYSCALL: {
+      unsigned long ssl_err = ERR_peek_error();  // NOLINT(runtime/int)
+
+      Local<Context> context = env()->isolate()->GetCurrentContext();
+      if (context.IsEmpty()) [[unlikely]]
+        return false;
+      const std::string error_str = GetBIOError();
+      Local<String> message = OneByteString(env()->isolate(), error_str);
+      if (message.IsEmpty()) [[unlikely]]
+        return false;
+      *error = Exception::Error(message);
+      if (error->IsEmpty()) [[unlikely]]
+        return false;
+      Local<Object> obj;
+      if (!(*error)->ToObject(context).ToLocal(&obj)) [[unlikely]]
+        return false;
+
+      const char* ls = ERR_lib_error_string(ssl_err);
+#if NCRYPTO_USE_OPENSSL3_PROVIDER
+      const char* fs = nullptr;
+#else
+      const char* fs = ERR_func_error_string(ssl_err);
+#endif
+      const char* rs = ERR_reason_error_string(ssl_err);
+      if (!Set(env(), obj, env()->library_string(), ls) ||
+          !Set(env(), obj, env()->function_string(), fs) ||
+          !Set(env(), obj, env()->reason_string(), rs, false))
+        return false;
+      // SSL has no API to recover the error name from the number, so we
+      // transform reason strings like "this error" to "ERR_SSL_THIS_ERROR",
+      // which ends up being close to the original error macro name.
+      std::string code(rs);
+      // TODO(RaisinTen): Pass an appropriate execution policy when it is
+      // implemented in our supported compilers.
+      std::transform(code.begin(), code.end(), code.begin(), [](char c) {
+        return c == ' ' ? '_' : ToUpper(c);
+      });
+      if (!Set(env(), obj, env()->code_string(), ("ERR_SSL_" + code).c_str())) {
+        return false;
+      }
+    }
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+void TLSWrap::EmitClearOutError(int err, Local<Value> error) {
+  if (err == SSL_ERROR_ZERO_RETURN) {
+    if (!flags_.eof) {
+      flags_.eof = true;
+      EmitRead(UV_EOF);
+    }
+    return;
+  }
+
+  Debug(this, "Got SSL error (%d), calling onerror", err);
+  // When TLS Alert are stored in wbio,
+  // it should be flushed to socket before destroyed.
+  if (BIO_pending(enc_out_) != 0) EncOut();
+
+  MakeCallback(env()->onerror_string(), 1, &error);
 }
 
 void TLSWrap::ClearIn() {
   Debug(this, "Trying to write cleartext input");
 
-  if (ssl_ == nullptr) {
+  if (ssl_ == nullptr || destroy_pending_) {
     Debug(this, "Returning from ClearIn(), ssl_ == nullptr");
     return;
   }
@@ -1440,6 +1498,15 @@ void TLSWrap::DestroySSL(const FunctionCallbackInfo<Value>& args) {
 }
 
 void TLSWrap::Destroy() {
+  if (in_ssl_library_call()) {
+    if (!destroy_pending_) {
+      destroy_pending_ = true;
+      BaseObjectPtr<TLSWrap> strong_ref{this};
+      env()->SetImmediate([this, strong_ref](Environment* env) { Destroy(); });
+    }
+    return;
+  }
+  destroy_pending_ = false;
   if (!ssl_)
     return;
 

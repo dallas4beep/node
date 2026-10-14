@@ -32,6 +32,7 @@
 
 #include <openssl/ssl.h>
 
+#include <span>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,7 @@ class TLSWrap : public AsyncWrap,
   inline bool is_cert_cb_running() const { return flags_.cert_cb_running; }
   inline bool is_waiting_cert_cb() const { return cert_cb_ != nullptr; }
   inline bool has_session_callbacks() const { return flags_.session_callbacks; }
+  bool FlushPendingClearOut();
   // We need to suspend the ClientHello only for server session id
   // callbacks, and only on the first pass.
   inline bool should_suspend_for_client_hello() const {
@@ -162,7 +164,7 @@ class TLSWrap : public AsyncWrap,
   // NOTE: Actually it is much more than this
   static constexpr int64_t kExternalSize = 6224 + 1040 + 42 * 1024;
 
-  static constexpr int kClearOutChunkSize = 16384;
+  static constexpr int kClearOutChunkSize = 64 * 1024;
 
   // Usual ServerHello + Certificate size
   static constexpr int kInitialClientBufferLength = 4096;
@@ -201,6 +203,12 @@ class TLSWrap : public AsyncWrap,
   void EncOut();  // Write encrypted data from enc_out_ to underlying stream.
   void ClearIn();  // SSL_write() clear data "in" to SSL.
   void ClearOut();  // SSL_read() clear text "out" from SSL.
+  bool EmitClearOut(std::span<const char> output);
+  // Reads the outcome of an SSL_read() that returned `read` <= 0. Must be
+  // called right after it, before calling into JS. Returns false if there
+  // is nothing to report.
+  bool GetClearOutError(int read, int* err, v8::Local<v8::Value>* error);
+  void EmitClearOutError(int err, v8::Local<v8::Value> error);
   void Destroy();
 
   // Call Done() on outstanding WriteWrap request.
@@ -320,6 +328,9 @@ class TLSWrap : public AsyncWrap,
   BIO* enc_out_ = nullptr;  // SSL_write()/handshake fills this for EncOut().
   // Waiting for ClearIn() to pass to SSL_write().
   std::unique_ptr<v8::BackingStore> pending_cleartext_input_;
+  // References ClearOut's stack buffer only while SSL_read() is on the stack.
+  std::span<const char> pending_cleartext_output_;
+  bool destroy_pending_ = false;
   size_t write_size_ = 0;
   BaseObjectPtr<AsyncWrap> current_write_;
   BaseObjectPtr<AsyncWrap> current_empty_write_;
